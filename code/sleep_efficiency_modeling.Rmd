@@ -1,0 +1,467 @@
+---
+title: "To Drink or Not to Drink?"
+subtitle: "Modeling the Effect of Alcohol on Sleep Efficiency"
+author: "Woojae Chung, Andy Guinto, Nayan Ganguli"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    number_sections: true
+header-includes:
+  - \usepackage{caption}
+  - \captionsetup[figure]{font=small}
+---
+
+\newpage
+
+```{r load packages and set options, include=FALSE}
+library(tidyverse) 
+library(magrittr)
+library(knitr)
+library(patchwork)
+library(moments)
+library(caret)
+library(GGally)
+library(stargazer)
+library(grid)
+library(gridExtra)
+library(ggplot2)
+library(cowplot)
+library(sandwich)
+library(janitor)
+library(dplyr)
+library(car)
+library(lmtest)
+library(psych)
+library(kableExtra)
+
+theme_set(theme_bw())
+options(tinytex.verbose = TRUE)
+knitr::opts_chunk$set(echo=FALSE, message=FALSE)
+```
+
+```{r load data, include=FALSE}
+data_sleep <- read.csv('./data/Sleep_Efficiency.csv')
+```
+
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+# List of columns to check
+columns_to_check <- c("Age", "Gender", "Sleep.efficiency", "Awakenings", "Alcohol.consumption", "Caffeine.consumption", "Exercise.frequency") 
+
+# Function to get value counts for a column
+df_name = data_sleep
+get_value_counts <- function(column_name) {
+  table(df_name[[column_name]], useNA = "always")
+}
+
+# Apply the function to specified columns
+value_counts_list <- sapply(columns_to_check, get_value_counts, simplify = FALSE)
+
+# Result
+value_counts_list
+```
+
+```{r remove NAs, echo=FALSE, message=FALSE, results='hide'}
+data_sleep <- data_sleep %>%
+  filter(!is.na(Sleep.efficiency),
+         !is.na(Awakenings),
+         !is.na(Alcohol.consumption),
+         !is.na(Caffeine.consumption),
+         !is.na(Exercise.frequency) # add any additional covariates here
+         )
+```
+
+```{r only keep those age 18+, echo=FALSE, message=FALSE, results='hide'}
+data_sleep <- data_sleep %>%
+  filter(Age >= 18)
+```
+
+```{r add BAC column, echo=FALSE, message=FALSE, results='hide'}
+# Avg weight of male - 78kg, female - 68kg
+avg_male_weight <- 78000
+male_gconstant <- 0.68
+avg_female_weight <- 68000
+female_gconstant <- 0.55
+
+# Convert alcohol consumption from oz to grams
+data_sleep$Alcohol.consumption.grams <- data_sleep$Alcohol.consumption * 28.3495
+data_sleep <- data_sleep %>% mutate(weight.gconstant = ifelse(data_sleep$Gender == "Male", avg_male_weight * male_gconstant, avg_female_weight * female_gconstant))
+data_sleep$BAC <- (data_sleep$Alcohol.consumption.grams * 100)/data_sleep$weight.gconstant
+```
+
+```{r only keep columns needed, echo=FALSE, message=FALSE, results='hide'}
+data_sleep <- data_sleep[, c("ID",
+                       "Age", # May include for demographic behavior
+                       "Gender", # May include for demographic behavior
+                       #"Bedtime", 
+                       #"Wakeup.time", # May include to incorporate weekday/weekend or holidays
+                       #"Sleep.duration",
+                       "Sleep.efficiency",
+                       #"REM.sleep.percentage",
+                       #"Deep.sleep.percentage",
+                       "Awakenings",
+                       "Caffeine.consumption",
+                       "Alcohol.consumption",
+                       #"Smoking.status",
+                       "Exercise.frequency",
+                       "BAC"
+                       )]
+```
+
+```{r value counts to sanity check data values after, echo=FALSE, message=FALSE, results='hide'}
+# List of columns to check
+columns_to_check <- c("Sleep.efficiency", "Awakenings", "BAC", "Caffeine.consumption", "Exercise.frequency") 
+
+# Function to get value counts for a column
+df_name = data_sleep
+get_value_counts <- function(column_name) {
+  table(df_name[[column_name]], useNA = "always")
+}
+
+# Apply the function to specified columns
+value_counts_list <- sapply(columns_to_check, get_value_counts, simplify = FALSE)
+```
+\vspace{-5truemm}
+
+# Introduction and Overview
+\vspace{-2truemm}
+A surveillance report from the National Institute on Alcohol Abuse and Alcoholism (NIAAA) states that alcohol consumption is at an all time high (Slater & Alpert, 2023), with many adults using alcohol as a sleeping aid (Stanley, 2019). But does alcohol _actually_ aid sleep? Although many individuals report falling asleep faster after alcohol consumption, this study provides a data-based approach to estimate the effect of alcohol consumption within 24 hours before bedtime on sleep efficiency. Formally, `Does alcohol increase sleep efficiency?` Sleep efficiency is defined as the amount of time asleep divided by the time spent in bed and most healthy adults have ~90%  (Sleep WA, 2023). The data contains subjects from Morocco along with other identifiable covariates such as the number of awakenings during the night, caffeine consumption, smoking status, and exercise frequency. 
+
+\vspace{-2truemm}
+
+# Description of the Data
+\vspace{-2truemm}
+The data was collected as part of a study conducted by ENSIAS in Morocco to study the relationship of caffeine, alcohol, and exercise against sleep. Over a span of one year, participants from a local community provided data through self-reported surveys, actigraphy, and polysonography. Although we acknowledge bias with those who agreed to participate, the participants within the local community were randomly sampled.
+
+The dataset includes 452 people, each row representing each subject. 51% of the subjects are male and 49% of the subjects are female which contributes to our BAC field (Discussed in the *Conceptualization and Operationalization*). The subjects fall between the ages of 20 and 60, drinking 0-50 grams of caffeine within 24 hours before bed, and drinking 0-6 ounces of alcohol within 24 hours before bed.
+
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+# par(mfrow = c(1, 2))
+
+caffeine_consumption <- data_sleep %>%
+  ggplot(aes(Caffeine.consumption)) +
+  geom_histogram(fill = "lightblue", bins = 5) +
+  labs(title = "Caff Dist.", x = "# grams", y = "Freq")
+#caffeine_consumption
+
+alcohol_consumption <- data_sleep %>%
+  ggplot(aes(Alcohol.consumption)) +
+  geom_histogram(fill = "lightblue", bins = 5) +
+  labs(title = "Alc Dist.", x = "# oz", y = "Freq")
+#alcohol_consumption
+
+age <- data_sleep %>%
+  ggplot(aes(Age)) +
+  geom_histogram(fill = "lightblue", bins = 5) +
+  labs(title = "Age Dist.", x = "age", y = "Freq")
+#age
+
+exercise <- data_sleep %>%
+  ggplot(aes(Exercise.frequency)) +
+  geom_histogram(fill = "lightblue", bins = 5) +
+  labs(title = "Exercise Dist.", x = "# exercised", y = "Freq")
+#exercise
+
+gender <- data_sleep %>%
+  ggplot(aes(x = "", fill = Gender)) +
+  geom_bar(stat = "count", width = 2) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(title = "Male vs Female")
+#gender
+
+all_plots <- arrangeGrob(caffeine_consumption, alcohol_consumption, age, exercise, gender, ncol=3)
+grid.draw(all_plots)
+```
+
+Additionally, in order to most effectively model the problem, we divide up the dataset into test and train. We randomly divide 30% of our data into train dataset and the remaining 70% into test. The smaller train set includes 116, assuring our sample is large.
+
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+set.seed(12345)
+index <- createDataPartition(data_sleep$ID, p = 0.3, list = FALSE)
+data_train <- data_sleep[index, ]
+data_test <- data_sleep[-index,]
+str(data_train)
+str(data_test)
+```
+
+\vspace{-2truemm}
+
+# Conceptualization and Operationalization
+\vspace{-2truemm}
+Before we dive into regression, we organize our key concepts with respect to our fields. The dataset provides the number of ounces of alcohol consumed 24 hours before bedtime. For a more accurate assessment, we create a BAC (blood alcohol content) field, calculated using the average weight within the region with respect to our alcohol consumption field. Below is a table of field definitions used in this study. With regards to our regression, the X concept is our `BAC`, while our Y concept is `Sleep.efficiency`, with the remaining variables serving as covariate fields to improve our regression model.
+
+```{r, echo=FALSE, results='asis'}
+# Data for the table
+table_data <- data.frame(
+  Column1 = c("Sleep Efficiency", "Blood Alcohol Content (BAC)", "Awakenings", "Caffeine Consumption", "Exercise Frequency"),
+  Column2 = c("Amount of time the subject is asleep divided by time spent in bed",
+              "Grams of alcohol consumed within 24 hours prior to bedtime * 100 divided by weight (from Geographical location) and gender constant",
+              "Number of times the subject wakes up throughout the sleeping period",
+              "Milligrams of caffeine consumed within 24 hours prior to bedtime",
+              "Average number of times the subject exercises per week"
+            )
+)
+
+# Create the table using kable
+kable(table_data, caption = "Variable Definitions", format = "markdown", align = "c", booktabs = TRUE, col.names = c("Label", "Definition"))
+```
+
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+summary(data_sleep)
+str(data_sleep)
+```
+
+\vspace{-5truemm}
+
+# Modeling Decisions & EDA
+\vspace{-2truemm}
+Before modeling the relationship between our variables, we remove any observations that do not contain information on our chosen variables mentioned in the introduction. We begin by removing observations from participants who are under the age of 18, which is the legal drinking age of Morocco, where the study was conducted. See `Table 2: Sample Accounting Table` below for specifications and sample sizes.
+
+\vspace{-1truemm}
+```{r, echo=FALSE, results='asis'}
+# Data for the table
+table_data <- data.frame(
+  Column1 = c("Start", "Remove Missing Values", "Under Drinking Age", "Train / Test"),
+  Column2 = c("452", "388", "379", "116 / 263"),
+  Column3 = c("-", "64", "9", "-")
+)
+# Create the table using kable
+kable(table_data, caption = "Sample Accounting Table", format = "markdown", align = "c", booktabs = TRUE, col.names = c("Cause", "Sample Available After Removal/Divide for Cause", "Sample Removed for Cause"))
+```
+\vspace{-3truemm}
+
+To more accurately estimate alcohol consumption and account for concentration in the genders, we transform the alcohol consumption given in ounces, to blood alcohol content (BAC). BAC requires the weight of the individuals. Since the dataset does not contain this weight, we use the average weight of the males and females in Morocco, and then use the simplified Widmark Formula to calculate the BAC:
+
+\vspace{-3truemm}
+$$
+BAC = \frac{Alcohol\ Consumed\ (grams)}{Body\ Weight\ (grams) * Gender\ Constant (0.55\ Male\  or\ 0.68\ Female)} *  100
+$$
+\vspace{-4truemm}
+
+From this point, we leave out other covariates that we think are either unimportant for the analysis or interfering with the outcome. This includes demographic variables, variables that are related to sleep efficiency, such as REM sleep percentage, deep sleep percentage, and sleep duration, as we believe they will cause biases in reverse causality and outcome variables on the right hand side. We also leave out variables that we are not interested in for this study, such as smoking status. While we considered the time period of when the data were recorded, we also left out timestamp variables like bedtime because there was no significant difference in the result. We further explore this in the *Limitations* section.
+
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+numeric_vars <- data_train[, c("Sleep.efficiency", "BAC", "Awakenings", "Exercise.frequency", "Caffeine.consumption")]
+numeric_vars %>%
+  gather() %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 20, fill = "blue", color = "black") + 
+  facet_wrap(~ key, scales = "free")
+```
+
+Plotting the variables of interest gives us an introductory knowledge of how they are distributed and related. We can see from `Figure 1` below that no variable of interest displays a normal distribution. Instead, there is a left skew in `Sleep.efficiency` and a right skew in `BAC`, `Awakenings`, and `Caffeine.consumption`. Nonetheless, the correlation between all variables do not deviate too much from a linear relationship. We can emphasize this further through representation of predictor variables to the outcome variable in `Figure 2`. Correlation between the covariates show a similarly linear relationship.  
+\vspace{-6truemm}
+
+```{r, fig.height = 6, fig.width = 8, fig.align = 'center', echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+colnames(numeric_vars) <- make.names(c('Sleep efficiency', 'BAC', 'Awakenings', 'Exercise frequency', 'Caffeine consumption'))
+correlation_plot <- ggpairs(numeric_vars, 
+                             title = "Figure 1: Distribution of and Correlation between Variables",
+                             lower = list(continuous = wrap("smooth", method = "loess")),
+                             upper = list(continuous = "cor", combo = "box"),
+                             columnLabels = gsub('.', ' ', colnames(numeric_vars), fixed = T),
+                             labeller = label_wrap_gen(10)) + 
+                        theme(plot.title = element_text(hjust = 0.5))
+correlation_plot
+```
+
+```{r, fig.height = 2, fig.width = 10, fig.align = 'center', echo=FALSE, message=FALSE, warning=FALSE}
+se_density <- data_train %>%
+  ggplot(aes(x = Sleep.efficiency)) +
+  geom_density()
+
+bac_density <- data_train %>%
+  ggplot(aes(x = BAC)) +
+  geom_density()
+
+awakenings_density <- data_train %>%
+  ggplot(aes(x = Awakenings)) +
+  geom_density()
+
+exercise_density <- data_train %>%
+  ggplot(aes(x = Exercise.frequency)) +
+  geom_density()
+
+caffeine_density <- data_train %>%
+  ggplot(aes(x = Caffeine.consumption)) +
+  geom_density()  
+
+grid.arrange(se_density, bac_density, awakenings_density, exercise_density, caffeine_density,
+                            ncol = 5,  
+                            top = "Figure 1: Density of Variables")
+```
+
+
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+se_vs_bac <- data_train %>%
+  ggplot(aes(x = BAC, y = Sleep.efficiency)) +
+  geom_point(position = "jitter", alpha = 0.5) + 
+  geom_smooth(method = "lm", se = FALSE, color = "blue") + 
+  geom_smooth(method = "loess", se = FALSE, color = "lightblue")
+```
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+se_vs_exercise <- data_train %>%
+  ggplot(aes(x = Exercise.frequency, y = Sleep.efficiency)) +
+  geom_point(alpha = 0.5) + 
+  geom_smooth(method = "lm", se = FALSE, color = "blue") + 
+  geom_smooth(method = "loess", se = FALSE, color = "lightblue")
+```
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+se_vs_awakenings <- data_train %>%
+  ggplot(aes(x = Awakenings, y = Sleep.efficiency)) +
+  geom_point(alpha = 0.5) + 
+  geom_smooth(method = "lm", se = FALSE, color = "blue") + 
+  geom_smooth(method = "loess", se = FALSE, color = "lightblue")
+```
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+se_vs_caffeine <- data_train %>%
+  ggplot(aes(x = Caffeine.consumption, y = Sleep.efficiency)) +
+  geom_point(position = "jitter", alpha = 0.5) + 
+  geom_smooth(method = "lm", se = FALSE, color = "blue") + 
+  geom_smooth(method = "loess", se = FALSE, color = "lightblue")
+```
+
+```{r, fig.height = 2, fig.width = 10, echo=FALSE, message=FALSE, warning=FALSE}
+grid.arrange(se_vs_bac, se_vs_exercise, se_vs_awakenings, se_vs_caffeine,
+                            ncol = 4,  
+                            top = "Figure 2: Linear Relationship of Sleep Efficiency vs Predictor Variables")
+```
+\vspace{-5truemm}
+
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+data_train %>%
+  ggplot(aes(x = Exercise.frequency, y = BAC)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE, color = "blue") + 
+  geom_smooth(method = "loess", se = FALSE, color = "lightblue")
+```
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+data_train %>%
+  ggplot(aes(x = Awakenings, y = BAC)) +
+  geom_point() + 
+  geom_smooth(method = "lm", se = FALSE, color = "blue") + 
+  geom_smooth(method = "loess", se = FALSE, color = "lightblue")
+```
+
+# Regression
+
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+model_1 = lm(Sleep.efficiency ~ BAC, data = data_train)
+summary(model_1)
+```
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+model_2 <- lm(Sleep.efficiency ~ BAC + Exercise.frequency + Awakenings + Caffeine.consumption, data = data_train)
+summary(model_2)
+```
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+model_3 <- lm(Sleep.efficiency ~ BAC + Awakenings, data = data_train)
+summary(model_3)
+```
+
+Our first model specification includes the outcome variable and the main predictor variable, `BAC`. This allows us to directly estimate the relationship between blood alcohol content and sleep efficiency. From the train dataset, the coefficient of `BAC` shows a negative relationship to sleep efficiency, with a p-value below 0.05. The second model adds in covariates `Exercise.frequency`, `Awakenings`, and `Caffeine.consumption`. As seen earlier from `Figure 2`, these variables have a reasonably linear relationship with `Sleep.efficiency`, so we do not make further transformations in the model. From the model in the train dataset, surprisingly, we see that neither caffeine consumption nor exercise frequency do not show significant results with p-values higher than 0.05. Hence in the third model, we take these variables out to only include significant explanatory variables in our test model. 
+
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+anova(model_1, model_2)
+```
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+anova(model_3, model_2)
+```
+
+To identify the variables which improve the model, we conduct a series of F-tests at each level, which indicate that the third model without `Exercise.frequency` and `Caffeine.consumption` is the better fit of all. This model has an R-Squared value around 0.4, explaining about 40% of the variability of the model. Formally, our final model is: 
+\vspace{-0.5truemm}
+$$
+Sleep Efficiency = \beta_0 + \beta_1 * BAC + \beta_2 * Awakenings
+$$
+\vspace{-6truemm}
+
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+model_test <- lm(Sleep.efficiency ~ BAC + Awakenings, data = data_test)
+summary(model_test)
+```
+  
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+model_1_test <- lm(Sleep.efficiency ~ BAC, data = data_test)
+model_2_test <- lm(Sleep.efficiency ~ BAC + Exercise.frequency + Awakenings + Caffeine.consumption, data = data_test)
+model_3_test <- lm(Sleep.efficiency ~ BAC + Awakenings, data = data_test)
+```
+
+```{r Regression Table of Test Dataset (for viewing only), results = "asis", include=FALSE}
+stargazer(model_1_test, model_2_test, model_3_test, 
+          type = 'text',
+          font.size = 'small',
+          title = "Regression Table of Test Dataset Models",
+          header = FALSE)
+```
+```{r Regression Table of Test Dataset, results = "asis"}
+stargazer(model_1_test, model_2_test, model_3_test, 
+          type = 'latex',
+          font.size = 'small',
+          title = "Regression Table of Test Dataset Models",
+          header = FALSE,
+          single.row = TRUE)
+```
+\vspace{-5truemm}
+
+# Discussion of Results
+
+The stargazer table above displays the regression outputs of the test dataset, with the regression coefficients of the test dataset having similarities to the train dataset. `Table 3: Regression Table of Test Dataset Models`, shows significant results for `Sleep.efficiency` for all three of our models. With a p-value of less than 0.05, we have evidence to suggest that a higher `BAC` has a negative causal relationship with sleep efficiency. The BAC coefficient of -0.348 signifies that a 0.1 increase in `BAC` leads to a 3.48% decrease in sleep efficiency, contradicting alcohol as a good sleep aid. Similarly, the number of `Awakenings` has a negative causal relationship with sleep efficiency. In the train dataset, the coefficient of Exercise.frequency was not significant, however using the test dataset, the second model has a significant coefficient with p-value less than 0.05.
+
+\vspace{-5truemm}
+
+# Limitations
+
+\vspace{-2truemm}
+
+## Large Sample Assumptions
+
+While our test dataset can be considered a large sample, there are limitations in meeting the large sample assumptions. The data was randomly sampled from subjects who self reported from Morocco, a homogeneous location with a high Muslim population that does not consume alcohol. This introduces bias in our data. Additionally, the data was collected over a one-year time window, meaning that environmental and behavioral changes from seasons and holidays also introduced bias. Although that the difference of reported data between different seasons were insignificant, we acknowledge that rejects the IID assumption.
+
+Secondly, visually the plots from the *Modeling Decisions & EDA* section lean towards our variables having deviations from normality. For example, `Sleep.efficiency` is left-skewed, and `BAC` is right-skewed. The covariates in the model are also not perfectly normal. The skewness for `BAC` was not close to 0, and the kurtosis for `BAC` and `Awakenings` were not close to 3, which lead us to acknowledge limitations in validating the second assumption.
+
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+skewness(data_train$Sleep.efficiency)
+kurtosis(data_train$Sleep.efficiency)
+skewness(data_train$BAC)
+kurtosis(data_train$BAC)
+skewness(data_train$Awakenings)
+kurtosis(data_train$Awakenings)
+```
+\vspace{-2truemm}
+
+## Classical Linear Model Assumptions 
+
+As discussed in the *Large Sample Assumptions* subsection, our data is not normally distributed which violates a CLM assumption. Running the Breusch-Pagan test against our final model gives a p-value less than 0.05, therefore rejecting the null hypothesis of homoskedasticity and assuming heteroskedasticity. This may mean that the standard statistical tests as discussed in the *Discussion of Results* section may not have an accurate standard error due to the variance across the board not being constant. To improve this model, we would need to make the variance across the board more constant, involving experimentation with additional data transformations and mathematical operations.
+
+```{r, echo=FALSE, message=FALSE, results='hide', include=FALSE}
+bptest(model_test)
+```
+\vspace{-2truemm}
+
+## Structural Limitations
+
+If our model included the number of hours before which a subject drank alcohol before bed, we could more accurately predict BAC, which could possibly decrease the coefficient of BAC on sleep if subjects consumed alcohol many hours before bed. This would make the omitted variable bias push away from zero. Additionally, if we included the times of electronics (assuming those that produce blue light) usage, we would be able to deduce the number of hours spent on screens. Generally, blue light is believed to influence sleep efficiency, which implies a negative effect on our sleep efficiency variable. Omitting this variable inflates the negative effect of BAC on sleep efficiency, pushing the direction of bias away from zero. 
+\vspace{-5truemm}
+
+
+A possible reverse causality in our model is awakenings with respect to sleep efficiency. For example, subjects with a large number of awakenings may decrease sleep efficiency. However, subjects with lower sleep efficiency may increase the number of awakenings, implying a negative direction of bias towards zero. Generally, those who consume alcohol more will also wake up more often. This can be substantiated from our data, as we can see that `BAC` has a positive relationship with `Awakenings`, implying that omitting this from the model would decrease the coefficient of `BAC` on `Sleep.efficiency`, introducing bias.
+\vspace{-2truemm}
+
+# Conclusion
+
+While alcohol is a popular a sleeping aid, this study proves that alcohol is a poor sleeping aid. Although our model depicts statistical significance, it must be considered with its limitations and biases. Further studies must consider randomly sampling subjects with related health conditions across different geographical locations. Finally, we hope that our results can be useful for other future studies. For example, a more in-depth study that will investigate whether alcohol consumed at a range of hours before bedtime has different effects on sleep efficiency.
+
+\newpage
+
+# Reference
+
+Bin, Y.S. (2016) Is sleep quality more important than sleep duration for public health?, Sleep. Available at: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4989250/ (Accessed: 02 December 2023)
+
+Sleep WA. (2023) Interpreting a sleep study. Available at: https://www.sleepwa.com.au/interpreting-a-sleep-study/#:~:text=Sleep%20Efficiency%20%E2%80%93%20Sleep%20efficiency%20refers,to%20be%2080%25%20or%20greater (Accessed: 02 December 2023)
+
+Stanley, N. (2019) Should I be using alcohol to help me sleep? Available at: https://www.sleepstation.org.uk/articles/insomnia/sleep-alcohol-and-mindful-drinking/ (Accessed: 02 December 2023)
+
+Slater, M.E. and Alpert, Hillel.C. (2023) Surveillance report #120, National Institute on Alcohol Abuse and Alcoholism. Available at: https://www.niaaa.nih.gov/publications/surveillance-reports/surveillance120 (Accessed: 02 December 2023)
+
+Holly Smith, D., & Schwontkowski, D. (2023). Blood alcohol content (BAC) calculator. Inch Calculator. Available at: https://www.inchcalculator.com/bac-calculator/#:~:text=The%20Widmark%20formula%20in%20simplified%20form (Accessed: 02 December 2023)
+
+Worlddata.info. (2023). Average height for men and women worldwide. Available at:
+https://www.worlddata.info/average-bodyheight.php (Accessed: December 02 2023)
